@@ -39,6 +39,146 @@ Treat the speedup as a reasoned ranking of candidates on that model, not as a me
 
 ---
 
+## Architecture
+
+AMP is a single-page lab. One React shell holds eight modules. One Zustand store holds the session. Three pure TypeScript pipelines do the actual work, and none of them leaves the browser.
+
+```mermaid
+flowchart TB
+  subgraph shell [Browser shell]
+    Route["src/routes/index.tsx"]
+    App["AmpApp shell"]
+    Store["useAmp · localStorage amp-console-v1"]
+    Route --> App
+    App --> Store
+  end
+
+  subgraph study [Study pipeline]
+    Analyze["analyze"]
+    Modes["buildModes or agentModes"]
+    Score["scoreAll · scoreMode"]
+    Codegen["renderCandidate"]
+    Winner["pickWinner"]
+    Analyze --> Modes --> Score
+    Score --> Codegen
+    Score --> Winner
+  end
+
+  subgraph side [Capacity planners]
+    Llm["reportLlm"]
+    Parallel["reportParallel"]
+    Tiles["autotuneRows · bestTile"]
+  end
+
+  Catalog["GPUS catalog"]
+  Store -->|"runOptimization"| Analyze
+  Store --> Llm
+  Store --> Parallel
+  Store --> Tiles
+  Catalog --> Score
+  Catalog --> Llm
+  Catalog --> Parallel
+  Catalog --> Tiles
+  Winner --> Store
+  Llm --> Store
+  Parallel --> Store
+```
+
+There is no server round-trip on Run, no job queue, and no worker process. `runOptimization`, `reportLlm`, and `reportParallel` are synchronous functions. The UI calls them and renders the object they return.
+
+### Layers
+
+| Layer | Lives in | Responsibility |
+| --- | --- | --- |
+| Shell | `src/routes/index.tsx`, `src/components/amp/app.tsx` | Header, GPU selector, module navigation. Renders exactly one module. |
+| Modules | `src/components/amp/*.tsx` | Forms and readouts. They do not score workloads themselves, except the kernel lab and the two planners, which call a pure function and render its return value. |
+| Session | `src/lib/amp/store.ts` | The only mutable state. Persists the open module, the pasted source, the controls, the last study, and history. |
+| Study engine | `analyze.ts`, `run.ts`, `model.ts`, `codegen.ts` | Turns source into an `Analysis`, then into `Candidate`s, then into one `RunResult`. |
+| Device model | `gpus.ts`, `types.ts` | Catalog peaks and the shared types. Every pipeline takes a `GpuSpec`. It never probes hardware. |
+| Capacity planners | `llm.ts`, `parallel.ts` | A second and third pipeline. They do not read the pasted kernel. They answer “does this model fit, and how should it be cut?” |
+
+`format.ts` and `bits.tsx` are presentation only: time, speedup, gigabytes, and the small metric widgets.
+
+### Three pipelines, one catalog
+
+The pasted-code study and the two planners share the GPU catalog and nothing else.
+
+| Pipeline | Entry | Input | Output | Who calls it |
+| --- | --- | --- | --- | --- |
+| Study | `runOptimization` | Source, instruction, `GpuSpec`, precision, objective, memory budget, optional agent flag | `RunResult` | Optimizer and Agent, through `store.run` |
+| Inference | `reportLlm` | `LlmModel`, `GpuSpec`, batch, prompt length, generated length, budget, continuous batching, speculation | `LlmReport` | LLM lab, on every render |
+| Placement | `reportParallel` | `GpuSpec`, `LlmModel`, device count, training flag, batch, sequence, microbatches | `ParallelReport` | Multi-GPU lab, on every render |
+| Tiles | `autotuneRows` | `Analysis` of the current source, `GpuSpec`, precision policy | One row per tile | Kernel lab |
+
+Overview, Profiler, and Benchmarks do not call the engine again. They read `lastRun` from the store, so the number on the profiler is the same number the optimizer just selected.
+
+### Study pipeline
+
+`runOptimization` in `src/lib/amp/run.ts` is the whole study:
+
+1. `analyze(code)` builds an `Analysis`: language, archetype, shapes, dtype, training flag, op list, and techniques already in the source.
+2. The instruction is interpreted **before** this call, inside the store. By the time the engine runs, the GPU, objective, precision policy, and budget are already concrete values. The engine does not re-parse English.
+3. `buildModes` (optimizer) or `agentModes` (agent) returns `ExecMode`s. An `ExecMode` is a strategy, not source: dtype, compile, flash, Triton GEMM, fused norm, drop-sync, vector width, and an optional tile.
+4. `scoreAll` scores the baseline first, then every other mode against that baseline time.
+5. `scoreMode` walks `analysis.ops`, sums a `Part` per op, then applies the numerical gate and the memory gate. `renderCandidate` fills in the source for that mode.
+6. `pickWinner` keeps the eligible row with the best time. Rows within 3% of that time break the tie toward the simpler strategy. Throughput, on a time tie, prefers the smaller working set.
+7. The result stores bottlenecks from the baseline, a short explanation, and, for an agent run, a step log. The optimizer does not ask for the log.
+
+Agent and optimizer are the same function. The agent passes `agent: true` and a step budget (default 6, clamped to 3–8 modes).
+
+### What an op costs
+
+`evalOp` is the roofline. Each `WorkOp` becomes a `Part` with FLOPs, compute microseconds, memory microseconds, launch microseconds, sync microseconds, and VRAM bytes. The step time is `max(compute, memory) + launch`, plus sync when the op is a host sync. Training multiplies GEMM and attention FLOPs by 3. Activation checkpointing trades a 1.3× recompute for a smaller activation footprint.
+
+| Op | Produced by the analyzer when | What the mode can change |
+| --- | --- | --- |
+| `gemm` | `nn.Linear`, `matmul`, or a pair of matrix constructors | Peak of the chosen dtype, compile vs eager efficiency, Triton tile efficiency |
+| `attention` | Softmax plus matmul, SDPA, or a fused QKV linear | Flash path drops the `S×S` score matrix. Eager attention launches about six kernels. |
+| `norm` | LayerNorm or RMSNorm | Fused Triton or `torch.compile` collapses three memory passes into one |
+| `pointwise` | An unfused elementwise epilogue | Compile or Triton folds it into the previous kernel |
+| `sync` | `.item()` or `.cpu()` | `drop-sync` deletes the term. Otherwise each call is charged ~180 µs on a small GPU and ~70 µs on a large one. |
+| `element` | A CUDA grid with a known `n` | `float4` and a grid-stride launch raise bandwidth efficiency |
+
+Launch cost depends on the GPU and on whether the mode is compiled. A compiled graph is not free, but it stops paying one launch per eager op. Host sync is never overlapped with compute.
+
+The numerical gate is a policy, not a executed comparison. FP32 passes at `1e-4`. TF32 is approximate at `1e-3`. BF16 is approximate at `2e-2`, with the note that training keeps FP32 master weights. FP8 fails the gate. Exact policy rejects every approximate row. A dtype the catalog lists as zero peak is rejected as not native.
+
+### Objects the UI actually holds
+
+```
+RunResult
+├── analysis: Analysis          what was read out of the source
+├── candidates: Candidate[]     baseline first, then alternatives
+│     ├── bench: Bench          median, p95, VRAM, TFLOP/s, bound, speedup, time split
+│     ├── check: Check          numerical, rtol, gradients, memorySafe, notes
+│     ├── code                  generated Python or CUDA
+│     └── eligible / rejectReason
+├── winnerId
+├── bottlenecks[]               share of the baseline, by compute / memory / launch / sync
+├── explanation[]
+└── agentLog?                   only when the agent ran
+```
+
+History is a list of those results. Forgetting a run drops it from history and, if it was the open one, the previous result becomes current.
+
+### Session and shell
+
+`useAmp` is a Zustand store with `persist`, key `amp-console-v1`. Hydration is skipped on the first paint and applied in an effect, so the server render and the first client render agree.
+
+Persisted fields: open module, GPU, source, sample id, instruction, objective, precision, memory budget, agent budget, last run, history, and the LLM and multi-GPU form values. Ephemeral notes from the instruction parser are not persisted.
+
+`loadSample` writes the sample source and instruction and switches the module to the optimizer. `run` reads the instruction, may change GPU, objective, precision, and budget, then replaces `lastRun` and prepends the result onto history. History keeps the newest 24 studies.
+
+The GPU selector in the header writes `gpuId` for every module. If the memory budget was still equal to the previous card’s full VRAM, it moves to the new card’s VRAM. A budget you set by hand is clamped, not overwritten.
+
+### What sits outside the engine
+
+TanStack Start serves the page. The route tree has a document shell and one index route that mounts `AmpApp`. Styling is Tailwind. Charts in the profiler and benchmark views are Recharts.
+
+Those pieces do not see the workload. Adding a module means a `ModuleId`, a nav entry, a panel, and either a reader of `lastRun` or a new pure function next to `llm.ts`. It does not mean a new backend.
+
+---
+
 ## Modules
 
 | Module | What it answers |
