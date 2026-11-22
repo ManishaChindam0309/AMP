@@ -54,6 +54,66 @@ Treat the speedup as a reasoned ranking of candidates on that model, not as a me
 
 On a narrow screen the same modules sit in a horizontal bar. The GPU selector stays in the header and applies across the lab.
 
+## Testing screenshots
+
+Captured from the running lab on an RTX 2050 Laptop, using the bundled transformer block. Times in these shots are the roofline model, not a live GPU profile. Desktop frames are 1440 px wide. The two phone frames are 390×844.
+
+### Overview
+
+Device card, the worked-example winner (SDPA + bf16 compile, 7.46×), workload loader, and recent studies.
+
+![Overview on desktop](docs/screenshots/01-overview.png)
+
+### Optimizer
+
+Instruction, precision, objective, memory budget, and the pasted block. The right side is the selection: architecture, shape, the candidate list, and the median-time comparison.
+
+![Optimizer with the transformer study](docs/screenshots/02-optimizer.png)
+
+### Profiler
+
+Where the winner spends time, and the operator list the analyzer extracted from the block.
+
+![Profiler for the transformer block](docs/screenshots/03-profiler.png)
+
+### Agent
+
+After **Run the search** with a step budget of 6. The trace keeps Flash SDPA + bf16 and rejects earlier rows that do not fit in 4 GB or do not beat the current selection.
+
+![Agent search trace](docs/screenshots/04-agent.png)
+
+### Kernel lab
+
+Tile chosen for this GPU, with efficiency against the catalog peaks.
+
+![Kernel tile lab](docs/screenshots/05-kernels.png)
+
+### LLM inference
+
+Llama 3 8B on the RTX 2050. BF16 does not fit in 4 GB. INT4 is the row the lab keeps.
+
+![LLM inference report](docs/screenshots/06-llm.png)
+
+### Multi-GPU
+
+Four RTX 2050s, inference, Llama 3 8B. The planner marks which placements fit on PCIe.
+
+![Multi-GPU placement](docs/screenshots/07-multigpu.png)
+
+### Benchmarks
+
+Every candidate from the open study, including rows rejected for memory, and a download of the winner.
+
+![Benchmark table](docs/screenshots/08-benchmarks.png)
+
+### Phone
+
+Same overview and optimizer at 390×844. The module list collapses to a horizontal bar. The optimizer stacks the source above the results.
+
+![Overview on a phone](docs/screenshots/09-overview-mobile.png)
+
+![Optimizer on a phone](docs/screenshots/10-optimizer-mobile.png)
+
 ---
 
 ## How a study runs
